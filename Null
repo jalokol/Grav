@@ -1,3 +1,33 @@
+--!native
+--!optimize 2
+--[[
+    FABLE  -  chess engine for Luau / Roblox
+    ------------------------------------------------------------------
+    Drop-in API compatible with Aether Prime:
+        local Fable = require(thisModule)
+        local move, score, reaction = Fable:GetBestMoveFromFEN(fen, thinkSeconds, options)
+
+    Extra:
+        Fable:Perft(fen, depth)                 -- move-generator self test
+        Fable:Duel(opponentEngine, {Games=10, ThinkTime=0.5})   -- built-in match harness
+        Fable:Configure({HashBits=18, NodeLimit=..., MaxQDepth=..., UseBook=true})
+        Fable:SetStyle("Balanced" | "Aggressive" | "Solid" | "Tactical" | "Endgame")
+
+    Main upgrades over a plain PVS engine:
+      * zero per-node table allocation (preallocated move/score/quiet buffers per ply)
+      * 2-way bucket transposition table with aging, TT-aware static eval, TT in qsearch
+      * PVS + aspiration windows, check extension, singular extensions + multi-cut
+      * null move (with verification), reverse futility, razoring, futility, late-move pruning,
+        SEE pruning (quiets + captures), internal iterative deepening
+      * LMR driven by history / continuation history / improving / PV / check
+      * butterfly history (persistent, aged) + 1-ply continuation history + killers + countermoves
+      * richer eval: tapered PST, bishop pair, mobility on safe squares, outposts, bad bishop,
+        passed pawns (king distance, blockers, supported, unstoppable), isolated/doubled/phalanx,
+        rook files + 7th, pawn threats, king shield + king-zone attack danger,
+        opposite-bishop / drawish scaling, KXK mop-up
+      * partial-iteration result acceptance and soft/hard time management
+]]
+
 local G = _G.__FABLE_V1 or {}
 _G.__FABLE_V1 = G
 
@@ -31,6 +61,7 @@ local PROMOS = {QUEEN, ROOK, BISHOP, KNIGHT}
 local FLAG_CAPTURE, FLAG_EP, FLAG_CASTLE, FLAG_DOUBLE = 1, 2, 4, 8
 local START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
 
+-- ON[s + 64] is true when 0x88 square s is on the board
 local ON = {}
 for i = 0, 255 do
     local s = i - 64
@@ -45,6 +76,9 @@ for i = 0, 127 do CM[i] = 15 end
 CM[0] = 13; CM[7] = 14; CM[4] = 12
 CM[112] = 7; CM[119] = 11; CM[116] = 3
 
+------------------------------------------------------------------------
+-- Zobrist (two independent 32-bit keys -> effectively 64-bit)
+------------------------------------------------------------------------
 G.Seed = G.Seed or 0x9E3779B1
 local function rand32()
     local x = G.Seed
@@ -73,6 +107,9 @@ end
 local ZP1, ZP2, ZC1, ZC2, ZE1, ZE2 = G.ZP1, G.ZP2, G.ZC1, G.ZC2, G.ZE1, G.ZE2
 local ZS1, ZS2 = G.ZS1, G.ZS2
 
+------------------------------------------------------------------------
+-- Piece-square tables (rank 8 first, white's point of view)
+------------------------------------------------------------------------
 local MAT_MG = {82, 337, 365, 477, 1025, 0}
 local MAT_EG = {94, 281, 297, 512, 936, 0}
 
@@ -164,6 +201,9 @@ for t = 1, 6 do
     end
 end
 
+------------------------------------------------------------------------
+-- Styles
+------------------------------------------------------------------------
 local STYLE = {
     Balanced   = {Att = 1.0, Safe = 1.0, Mob = 1.0, Pwn = 1.0, Contempt = 10, Center = 4, LMR = 1.0},
     Aggressive = {Att = 1.35, Safe = 0.85, Mob = 1.1, Pwn = 0.95, Contempt = 22, Center = 6, LMR = 1.0},
@@ -172,6 +212,9 @@ local STYLE = {
     Endgame    = {Att = 0.8, Safe = 0.9, Mob = 1.0, Pwn = 1.3, Contempt = 5, Center = 4, LMR = 1.0},
 }
 
+------------------------------------------------------------------------
+-- Moves
+------------------------------------------------------------------------
 local function moveName(m)
     local from, to, promo = band(m, 127), band(rshift(m, 7), 127), band(rshift(m, 14), 7)
     local s = string.char(97 + band(from, 15)) .. tostring(rshift(from, 4) + 1)
@@ -184,6 +227,9 @@ local function squareName(s)
     return string.char(97 + band(s, 15)) .. tostring(rshift(s, 4) + 1)
 end
 
+------------------------------------------------------------------------
+-- Attacks
+------------------------------------------------------------------------
 local function isAttacked(E, s, by)
     local B = E.board
     if by == WHITE then
@@ -239,6 +285,9 @@ local function inCheck(E, side)
     return isAttacked(E, k, -side)
 end
 
+------------------------------------------------------------------------
+-- Move generation (pseudo-legal) into a caller-supplied buffer
+------------------------------------------------------------------------
 local function generate(E, moves, capsOnly)
     local B = E.board
     local n = 0
@@ -361,6 +410,9 @@ local function generate(E, moves, capsOnly)
     return n
 end
 
+------------------------------------------------------------------------
+-- Make / unmake (incremental hash, mg/eg, phase, non-pawn material)
+------------------------------------------------------------------------
 local function restore(E, S)
     local B = E.board
     local rf = S.rookFrom
@@ -498,6 +550,10 @@ local function unmakeMove(E, m, ply)
     restore(E, E.stack[ply])
     E.repN = E.repN - 1
 end
+
+------------------------------------------------------------------------
+-- Static Exchange Evaluation
+------------------------------------------------------------------------
 local function leastAttacker(B, s, side)
     if side == WHITE then
         local a = s - 15
@@ -609,6 +665,9 @@ local function see(E, m)
     return seeGain[1]
 end
 
+------------------------------------------------------------------------
+-- Evaluation
+------------------------------------------------------------------------
 local PASS_MG = {0, 5, 10, 20, 35, 60, 100, 0}
 local PASS_EG = {0, 10, 20, 40, 70, 120, 190, 0}
 local THREAT = {0, 25, 25, 45, 60, 0}
@@ -896,8 +955,8 @@ local function evaluate(E)
     local mg = E.mg + wmg - bmg
     local eg = E.eg + weg - beg
     local att = st.Att
-    local dW = dangerOf(baw, ban, CB[5], att)
-    local dB = dangerOf(waw, wan, CW[5], att)
+    local dW = dangerOf(baw, ban, CB[5], att) -- black attacking white king
+    local dB = dangerOf(waw, wan, CW[5], att) -- white attacking black king
     mg = mg - dW + dB
     eg = eg - dW * 0.25 + dB * 0.25
 
@@ -906,6 +965,7 @@ local function evaluate(E)
     local score = floor((mg * ph + eg * (24 - ph)) / 24)
     score = score + stm * TEMPO
 
+    -- opposite-coloured bishops
     if CW[3] == 1 and CB[3] == 1 and CW[2] + CB[2] + CW[4] + CB[4] + CW[5] + CB[5] == 0 then
         local ws, bs = LW[3][1], LB[3][1]
         if band(band(ws, 15) + rshift(ws, 4), 1) ~= band(band(bs, 15) + rshift(bs, 4), 1) then
@@ -937,6 +997,9 @@ local function staticEval(E, alpha, beta)
     return evaluate(E)
 end
 
+------------------------------------------------------------------------
+-- Transposition table: 2-way buckets, aging
+------------------------------------------------------------------------
 local function newTT(bits)
     local size = bit.lshift(1, bits)
     return {
@@ -989,6 +1052,9 @@ local function ttStore(E, depth, score, bound, move, ply)
     end
 end
 
+------------------------------------------------------------------------
+-- Search helpers
+------------------------------------------------------------------------
 local LMRT = {}
 for d = 1, 64 do
     LMRT[d] = {}
@@ -1248,9 +1314,11 @@ local function negamax(E, depth, alpha, beta, ply, allowNull, excluded)
 
     local side = E.side
     if not isPV and not checked and abs(beta) < MATE - 1000 then
+        -- reverse futility
         if depth <= 7 and static - 80 * depth + (improving and 0 or 30) >= beta then
             return static
         end
+        -- razoring
         if depth <= 2 and static + 250 * depth <= alpha then
             local q = qsearch(E, alpha, beta, ply, 0)
             if E.abort then return 0 end
@@ -1292,6 +1360,7 @@ local function negamax(E, depth, alpha, beta, ply, allowNull, excluded)
         end
     end
 
+    -- internal iterative deepening
     if isPV and ttMove == 0 and depth >= 5 and excluded == 0 then
         negamax(E, depth - 2, alpha, beta, ply, false, 0)
         if E.abort then return 0 end
@@ -1335,6 +1404,7 @@ local function negamax(E, depth, alpha, beta, ply, allowNull, excluded)
             end
 
             if not prune then
+                -- singular extension (done before the move is made)
                 local ext = 0
                 if m == ttMove and excluded == 0 and ply > 0 and depth >= 7 and ttDepth >= depth - 3
                     and (ttBound == 0 or ttBound == 2) and abs(ttScore) < MATE - 1000 then
@@ -1489,6 +1559,9 @@ local function rootSearch(E, depth, alpha, beta)
     return bestMove, best, true
 end
 
+------------------------------------------------------------------------
+-- FEN
+------------------------------------------------------------------------
 local FENP = {P = 1, N = 2, B = 3, R = 4, Q = 5, K = 6, p = -1, n = -2, b = -3, r = -4, q = -5, k = -6}
 local PCH = {"P", "N", "B", "R", "Q", "K"}
 
@@ -1602,6 +1675,9 @@ local function toFEN(E, fullmove)
         .. " " .. tostring(E.half) .. " " .. tostring(fullmove or 1)
 end
 
+------------------------------------------------------------------------
+-- Opening book
+------------------------------------------------------------------------
 local BOOK_LINES = {
     "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7 f1e1 b7b5 a4b3 d7d6 c2c3 e8g8 h2h3",
     "e2e4 e7e5 g1f3 b8c6 f1b5 g8f6 e1g1 f6e4 d2d4 e4d6 b5c6 d7c6 d4e5 d6f5 d1d8 e8d8",
@@ -1656,6 +1732,9 @@ local function buildBook()
     return book
 end
 
+------------------------------------------------------------------------
+-- Engine API
+------------------------------------------------------------------------
 local Engine = {Name = "Fable", Version = "1.0"}
 
 if not G.History then
@@ -1771,6 +1850,7 @@ function Engine:GetBestMoveFromFEN(fen, thinkTime, options)
         E.rep1, E.rep2, E.repN = r1, r2, #r1
     end
 
+    -- legal root moves, ordered
     local pseudo = {}
     local np = generate(E, pseudo, false)
     local rootTT = 0
@@ -1895,6 +1975,7 @@ function Engine:GetBestMoveFromFEN(fen, thinkTime, options)
             if score > MATE - 1000 and (MATE - score) <= depth then break end
             if stable >= 5 and elapsed > requested * 0.2 and depth >= 9 then break end
         else
+            -- aborted: accept a move only if it was fully searched inside the window
             if m ~= 0 and score > winLo and score < winHi then
                 bestMove, bestScore = m, score
             end
@@ -1921,6 +2002,10 @@ function Engine:Analyze(fen, thinkTime, options)
     return {Move = move, Score = score, Reaction = reaction, Stats = G.LastStats}
 end
 
+------------------------------------------------------------------------
+-- Duel harness: plays Fable against any engine exposing
+-- opponent:GetBestMoveFromFEN(fen, seconds, {History=..., UseBook=false})
+------------------------------------------------------------------------
 local function insufficient(E)
     local minors = 0
     for idx = 1, 64 do
